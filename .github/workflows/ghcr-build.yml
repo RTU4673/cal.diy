@@ -1,0 +1,121 @@
+name: GHCR Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      REF:
+        description: "Git ref to build (branch, tag or sha)"
+        required: false
+        default: "main"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-amd64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      IMAGE: ghcr.io/rtu4673/cal.diy
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.REF || 'main' }}
+
+      - name: Compute image tag
+        id: tag
+        run: echo "tag=main-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Start database
+        run: |
+          docker network create stack
+          docker run -d --name database --network stack \
+            -e POSTGRES_USER=unicorn_user \
+            -e POSTGRES_PASSWORD=ci_dummy_pw \
+            -e POSTGRES_DB=calendso \
+            postgres:16-alpine
+          for i in $(seq 1 60); do
+            if docker exec database pg_isready -U unicorn_user -d calendso >/dev/null 2>&1; then
+              echo "postgres ready"; break
+            fi
+            sleep 2
+          done
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=container:database
+          buildkitd-flags: --allow-insecure-entitlement security.insecure --allow-insecure-entitlement network.host
+
+      - name: Build image
+        id: docker_build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./
+          file: ./Dockerfile
+          load: true
+          push: false
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
+          build-args: |
+            NEXT_PUBLIC_WEBAPP_URL=http://localhost:3000
+            NEXT_PUBLIC_API_V2_URL=http://localhost:5555/api/v2
+            NEXT_PUBLIC_LICENSE_CONSENT=agree
+            DATABASE_URL=postgresql://unicorn_user:ci_dummy_pw@localhost:5432/calendso
+            DATABASE_DIRECT_URL=postgresql://unicorn_user:ci_dummy_pw@localhost:5432/calendso
+
+      - name: Test runtime
+        run: |
+          set -o pipefail
+          docker run --rm --network stack -p 3000:3000 \
+            -e DATABASE_URL=postgresql://unicorn_user:ci_dummy_pw@database:5432/calendso \
+            -e DATABASE_DIRECT_URL=postgresql://unicorn_user:ci_dummy_pw@database:5432/calendso \
+            -e NEXTAUTH_SECRET=ci_nextauth_secret_0123456789abcdef \
+            -e CALENDSO_ENCRYPTION_KEY=0zfLtY99wjeLnsM7qsa8xsT+Q0oSgnOL \
+            ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }} > /tmp/app.log 2>&1 &
+          sleep 150
+          for i in $(seq 1 45); do
+            code=$(curl -o /dev/null -s -w "%{http_code}" http://localhost:3000/auth/login || true)
+            echo "health check $i: $code"
+            if [ "$code" = "200" ] || [ "$code" = "307" ]; then
+              echo "SERVER IS HEALTHY"; exit 0
+            fi
+            sleep 4
+          done
+          echo "--- health check failed, app logs: ---"
+          tail -50 /tmp/app.log || true
+          exit 1
+
+      - name: Push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
+          build-args: |
+            NEXT_PUBLIC_WEBAPP_URL=http://localhost:3000
+            NEXT_PUBLIC_API_V2_URL=http://localhost:5555/api/v2
+            NEXT_PUBLIC_LICENSE_CONSENT=agree
+            DATABASE_URL=postgresql://unicorn_user:ci_dummy_pw@localhost:5432/calendso
+            DATABASE_DIRECT_URL=postgresql://unicorn_user:ci_dummy_pw@localhost:5432/calendso
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f database || true
+          docker network rm stack || true
+
+      - name: Summary
+        if: success()
+        run: echo "Pushed ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }} (from ref ${{ inputs.REF || 'main' }})" >> $GITHUB_STEP_SUMMARY
